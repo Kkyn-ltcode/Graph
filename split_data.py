@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torch_geometric.data import Data
 
-def split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2, seed=42):
+def split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2, seed=42, stratify=True):
     """
     Split a graph into train/valid/test subgraphs where:
     - Train: only contains train nodes and their edges
@@ -15,6 +15,7 @@ def split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2, seed=42)
         valid_ratio: proportion of nodes for validation
         test_ratio: proportion of nodes for testing
         seed: random seed for reproducibility
+        stratify: if True, perform stratified split based on labels
     
     Returns:
         train_data, valid_data, test_data: Three Data objects
@@ -23,16 +24,53 @@ def split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2, seed=42)
     torch.manual_seed(seed)
     
     num_nodes = data.x.size(0)
-    indices = np.random.permutation(num_nodes)
     
-    # Calculate split sizes
-    train_size = int(num_nodes * train_ratio)
-    valid_size = int(num_nodes * valid_ratio)
-    
-    # Split node indices
-    train_nodes = indices[:train_size]
-    valid_nodes = indices[train_size:train_size + valid_size]
-    test_nodes = indices[train_size + valid_size:]
+    if stratify and data.y is not None:
+        # Stratified split based on labels
+        labels = data.y.cpu().numpy()
+        unique_labels = np.unique(labels)
+        
+        train_nodes = []
+        valid_nodes = []
+        test_nodes = []
+        
+        # Split each class separately
+        for label in unique_labels:
+            label_indices = np.where(labels == label)[0]
+            n_label = len(label_indices)
+            
+            # Shuffle indices for this label
+            np.random.shuffle(label_indices)
+            
+            # Calculate split sizes for this label
+            train_size = int(n_label * train_ratio)
+            valid_size = int(n_label * valid_ratio)
+            
+            # Split indices
+            train_nodes.extend(label_indices[:train_size])
+            valid_nodes.extend(label_indices[train_size:train_size + valid_size])
+            test_nodes.extend(label_indices[train_size + valid_size:])
+        
+        # Convert to numpy arrays and shuffle
+        train_nodes = np.array(train_nodes)
+        valid_nodes = np.array(valid_nodes)
+        test_nodes = np.array(test_nodes)
+        
+        np.random.shuffle(train_nodes)
+        np.random.shuffle(valid_nodes)
+        np.random.shuffle(test_nodes)
+    else:
+        # Random split (original behavior)
+        indices = np.random.permutation(num_nodes)
+        
+        # Calculate split sizes
+        train_size = int(num_nodes * train_ratio)
+        valid_size = int(num_nodes * valid_ratio)
+        
+        # Split node indices
+        train_nodes = indices[:train_size]
+        valid_nodes = indices[train_size:train_size + valid_size]
+        test_nodes = indices[train_size + valid_size:]
     
     # Create node sets for efficient lookup
     train_set = set(train_nodes.tolist())
@@ -121,7 +159,7 @@ if __name__ == "__main__":
     data = Data(x=x, edge_index=edge_index, y=y)
     
     # Split the graph
-    train_data, valid_data, test_data = split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2)
+    train_data, valid_data, test_data = split_graph(data, train_ratio=0.6, valid_ratio=0.2, test_ratio=0.2, stratify=True)
     
     print(f"Original graph: {data.num_nodes} nodes, {data.num_edges} edges")
     print(f"\nTrain graph: {train_data.num_nodes} nodes, {train_data.num_edges} edges")
@@ -131,3 +169,10 @@ if __name__ == "__main__":
     print(f"\nTrain has only train nodes: {train_data.num_nodes}")
     print(f"Valid has train + valid nodes: {valid_data.num_nodes}")
     print(f"Test has all nodes: {test_data.num_nodes}")
+    
+    # Verify stratification
+    print("\n=== Label Distribution ===")
+    print("Original:", torch.bincount(data.y))
+    print("Train:   ", torch.bincount(train_data.y))
+    print("Valid:   ", torch.bincount(valid_data.y))
+    print("Test:    ", torch.bincount(test_data.y))
