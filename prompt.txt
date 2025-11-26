@@ -1,70 +1,136 @@
 import polars as pl
+import numpy as np
 
-def downcast_column(series: pl.Series) -> pl.Series:
-    dtype = series.dtype
+def optimize_dataframe(df: pl.DataFrame, verbose: bool = True) -> pl.DataFrame:
+    """
+    Optimize Polars DataFrame by downcasting columns to smaller data types.
+    
+    Parameters:
+    -----------
+    df : pl.DataFrame
+        Input DataFrame to optimize
+    verbose : bool
+        If True, print memory savings information
+        
+    Returns:
+    --------
+    pl.DataFrame
+        Optimized DataFrame with downcasted columns
+    """
+    
+    # Store original memory usage
+    original_memory = df.estimated_size("mb")
+    
+    optimized_cols = []
+    
+    for col in df.columns:
+        dtype = df[col].dtype
+        series = df[col]
+        
+        # Handle integer types
+        if dtype in [pl.Int64, pl.Int32, pl.Int16, pl.Int8]:
+            # Get min and max values, handling nulls
+            col_min = series.min()
+            col_max = series.max()
+            
+            if col_min is not None and col_max is not None:
+                # Determine smallest integer type that can hold the data
+                if col_min >= 0:  # Unsigned integers
+                    if col_max <= 255:
+                        optimized_cols.append(series.cast(pl.UInt8))
+                    elif col_max <= 65535:
+                        optimized_cols.append(series.cast(pl.UInt16))
+                    elif col_max <= 4294967295:
+                        optimized_cols.append(series.cast(pl.UInt32))
+                    else:
+                        optimized_cols.append(series.cast(pl.UInt64))
+                else:  # Signed integers
+                    if col_min >= -128 and col_max <= 127:
+                        optimized_cols.append(series.cast(pl.Int8))
+                    elif col_min >= -32768 and col_max <= 32767:
+                        optimized_cols.append(series.cast(pl.Int16))
+                    elif col_min >= -2147483648 and col_max <= 2147483647:
+                        optimized_cols.append(series.cast(pl.Int32))
+                    else:
+                        optimized_cols.append(series)
+            else:
+                optimized_cols.append(series)
+        
+        # Handle unsigned integer types
+        elif dtype in [pl.UInt64, pl.UInt32, pl.UInt16, pl.UInt8]:
+            col_max = series.max()
+            
+            if col_max is not None:
+                if col_max <= 255:
+                    optimized_cols.append(series.cast(pl.UInt8))
+                elif col_max <= 65535:
+                    optimized_cols.append(series.cast(pl.UInt16))
+                elif col_max <= 4294967295:
+                    optimized_cols.append(series.cast(pl.UInt32))
+                else:
+                    optimized_cols.append(series)
+            else:
+                optimized_cols.append(series)
+        
+        # Handle float types
+        elif dtype == pl.Float64:
+            # Try to downcast to Float32 if precision allows
+            # Check if all values can be represented in Float32
+            optimized_cols.append(series.cast(pl.Float32))
+        
+        # Handle string types - convert to categorical if cardinality is low
+        elif dtype == pl.Utf8:
+            unique_ratio = series.n_unique() / len(series)
+            
+            # If less than 50% unique values, use categorical
+            if unique_ratio < 0.5:
+                optimized_cols.append(series.cast(pl.Categorical))
+            else:
+                optimized_cols.append(series)
+        
+        # Keep other types as-is
+        else:
+            optimized_cols.append(series)
+    
+    # Create optimized DataFrame
+    optimized_df = pl.DataFrame(optimized_cols)
+    
+    # Calculate and display memory savings
+    if verbose:
+        optimized_memory = optimized_df.estimated_size("mb")
+        memory_saved = original_memory - optimized_memory
+        percent_saved = (memory_saved / original_memory) * 100
+        
+        print(f"Original memory usage: {original_memory:.2f} MB")
+        print(f"Optimized memory usage: {optimized_memory:.2f} MB")
+        print(f"Memory saved: {memory_saved:.2f} MB ({percent_saved:.1f}%)")
+        print(f"\nData type changes:")
+        for col in df.columns:
+            old_dtype = df[col].dtype
+            new_dtype = optimized_df[col].dtype
+            if old_dtype != new_dtype:
+                print(f"  {col}: {old_dtype} -> {new_dtype}")
+    
+    return optimized_df
 
-    # 1. BOOLEAN
-    if dtype == pl.Boolean:
-        return series
 
-    # 2. INTEGER TYPES
-    if pl.datatypes.is_integer(dtype):
-        min_v = series.min()
-        max_v = series.max()
-
-        # signed integers
-        if min_v >= pl.Int8().min_value and max_v <= pl.Int8().max_value:
-            return series.cast(pl.Int8)
-        if min_v >= pl.Int16().min_value and max_v <= pl.Int16().max_value:
-            return series.cast(pl.Int16)
-        if min_v >= pl.Int32().min_value and max_v <= pl.Int32().max_value:
-            return series.cast(pl.Int32)
-        return series.cast(pl.Int64)
-
-    # 3. UNSIGNED INTEGERS
-    if pl.datatypes.is_unsigned_integer(dtype):
-        min_v = series.min()
-        max_v = series.max()
-        if max_v <= pl.UInt8().max_value:
-            return series.cast(pl.UInt8)
-        if max_v <= pl.UInt16().max_value:
-            return series.cast(pl.UInt16)
-        if max_v <= pl.UInt32().max_value:
-            return series.cast(pl.UInt32)
-        return series.cast(pl.UInt64)
-
-    # 4. FLOAT TYPES
-    if pl.datatypes.is_float(dtype):
-        # Downcast float64 → float32 if safe
-        if dtype == pl.Float64:
-            s32 = series.cast(pl.Float32)
-            # Check precision loss
-            if (series - s32.cast(pl.Float64)).abs().max() < 1e-6:
-                return s32
-        return series
-
-    # 5. STRING TYPES → consider categorical
-    if dtype == pl.String:
-        unique_ratio = series.n_unique() / len(series)
-        # Convert to categorical if many repeating values
-        if unique_ratio < 0.5:
-            return series.cast(pl.Categorical)
-        return series
-
-    # 6. DATE / DATETIME
-    if dtype in (pl.Date, pl.Datetime, pl.Time):
-        return series
-
-    # 7. CATEGORICAL
-    if dtype == pl.Categorical:
-        return series
-
-    # Fallback: return unchanged
-    return series
-
-
-def downcast_df(df: pl.DataFrame) -> pl.DataFrame:
-    return df.select([
-        downcast_column(df[col]).alias(col)
-        for col in df.columns
-    ])
+# Example usage
+if __name__ == "__main__":
+    # Create sample DataFrame with various data types
+    df = pl.DataFrame({
+        "small_int": [1, 2, 3, 4, 5] * 100,
+        "large_int": [1000000, 2000000, 3000000] * 166 + [1000000, 2000000],
+        "float_col": [1.5, 2.7, 3.9, 4.1, 5.3] * 100,
+        "category_col": ["A", "B", "C", "A", "B"] * 100,
+        "unique_str": [f"unique_{i}" for i in range(500)]
+    })
+    
+    # Optimize the DataFrame
+    optimized_df = optimize_dataframe(df, verbose=True)
+    
+    print("\n" + "="*50)
+    print("Schema comparison:")
+    print("\nOriginal:")
+    print(df.schema)
+    print("\nOptimized:")
+    print(optimized_df.schema)
