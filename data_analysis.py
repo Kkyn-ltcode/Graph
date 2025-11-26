@@ -4,13 +4,14 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime
 
-def analyze_netflow_dataset(file_path, sample_size=100000):
+def analyze_netflow_dataset(file_path, sample_size=1000000):
     """
     Comprehensive analysis of NetFlow dataset for graph construction
+    Focus: Multi-class attack classification with GNN
     
     Args:
         file_path: Path to the CSV file
-        sample_size: Number of rows to sample for detailed analysis (default 100k)
+        sample_size: Number of rows to sample for detailed analysis (default 1M)
     """
     
     print(f"Starting analysis at {datetime.now()}")
@@ -46,17 +47,34 @@ def analyze_netflow_dataset(file_path, sample_size=100000):
     }
     
     # === ATTACK TYPE ANALYSIS ===
-    print("\n=== Analyzing Attack Types ===")
+    print("\n=== Analyzing Attack Types (Multi-class Focus) ===")
     attack_counts = df.group_by("Attack").agg(pl.count()).sort("count", descending=True)
     results["attack_distribution"] = {
         "class_distribution": attack_counts.to_dicts(),
         "num_classes": len(attack_counts),
         "most_common": attack_counts[0, "Attack"],
-        "least_common": attack_counts[-1, "Attack"]
+        "least_common": attack_counts[-1, "Attack"],
+        "class_balance_metrics": {
+            "max_samples": int(attack_counts[0, "count"]),
+            "min_samples": int(attack_counts[-1, "count"]),
+            "imbalance_ratio": float(attack_counts[0, "count"] / attack_counts[-1, "count"])
+        }
     }
+    
+    # Per-class percentage
+    total = df.shape[0]
+    attack_percentages = []
+    for row in attack_counts.to_dicts():
+        attack_percentages.append({
+            "attack_type": row["Attack"],
+            "count": row["count"],
+            "percentage": float(row["count"] / total * 100)
+        })
+    results["attack_distribution"]["detailed_percentages"] = attack_percentages
     
     # === SAMPLE DETAILED ANALYSIS ===
     print(f"\n=== Sampling {sample_size:,} rows for detailed analysis ===")
+    # With 1TB RAM, we can afford a larger sample
     df_sample = df.sample(n=min(sample_size, len(df)), seed=42)
     
     # === COLUMN-WISE STATISTICS ===
@@ -118,10 +136,33 @@ def analyze_netflow_dataset(file_path, sample_size=100000):
     # === GRAPH CONSTRUCTION INSIGHTS ===
     print("\n=== Generating Graph Construction Insights ===")
     
-    # Potential node definitions
-    ip_pairs = df_sample.group_by(["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]).agg(pl.count())
+    # Potential node definitions - IP level
+    ip_pairs = df_sample.group_by(["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]).agg(
+        pl.count().alias("flow_count"),
+        pl.col("Attack").n_unique().alias("unique_attacks")
+    )
     results["graph_construction_insights"]["unique_ip_pairs"] = len(ip_pairs)
-    results["graph_construction_insights"]["avg_flows_per_ip_pair"] = float(ip_pairs["count"].mean())
+    results["graph_construction_insights"]["avg_flows_per_ip_pair"] = float(ip_pairs["flow_count"].mean())
+    results["graph_construction_insights"]["ip_pairs_with_multiple_attack_types"] = int(
+        (ip_pairs["unique_attacks"] > 1).sum()
+    )
+    
+    # Graph density metrics
+    num_unique_ips = df_sample.select([
+        pl.col("IPV4_SRC_ADDR").unique().count().alias("src"),
+        pl.col("IPV4_DST_ADDR").unique().count().alias("dst")
+    ]).row(0)
+    
+    total_possible_edges = num_unique_ips[0] * num_unique_ips[1]
+    actual_edges = len(ip_pairs)
+    
+    results["graph_construction_insights"]["graph_density"] = {
+        "unique_src_ips": int(num_unique_ips[0]),
+        "unique_dst_ips": int(num_unique_ips[1]),
+        "possible_edges": int(total_possible_edges),
+        "actual_edges": int(actual_edges),
+        "density": float(actual_edges / total_possible_edges) if total_possible_edges > 0 else 0
+    }
     
     # Connection patterns
     src_connections = df_sample.group_by("IPV4_SRC_ADDR").agg(
@@ -147,10 +188,39 @@ def analyze_netflow_dataset(file_path, sample_size=100000):
     }
     
     # Temporal patterns
+    print("\n=== Analyzing Temporal Patterns ===")
     if "FLOW_START_MILLISECONDS" in df_sample.columns:
-        time_range = df_sample["FLOW_START_MILLISECONDS"].max() - df_sample["FLOW_START_MILLISECONDS"].min()
-        results["graph_construction_insights"]["temporal_span_ms"] = int(time_range)
-        results["graph_construction_insights"]["temporal_span_hours"] = float(time_range / (1000 * 3600))
+        # Convert to datetime for better understanding
+        min_time = df_sample["FLOW_START_MILLISECONDS"].min()
+        max_time = df_sample["FLOW_START_MILLISECONDS"].max()
+        time_range = max_time - min_time
+        
+        results["graph_construction_insights"]["temporal_analysis"] = {
+            "time_range_ms": int(time_range),
+            "time_range_seconds": float(time_range / 1000),
+            "time_range_minutes": float(time_range / (1000 * 60)),
+            "time_range_hours": float(time_range / (1000 * 3600)),
+            "time_range_days": float(time_range / (1000 * 3600 * 24)),
+            "min_timestamp": int(min_time),
+            "max_timestamp": int(max_time)
+        }
+        
+        # Temporal distribution of attacks
+        df_sample_with_time = df_sample.with_columns([
+            (pl.col("FLOW_START_MILLISECONDS") - min_time).alias("relative_time_ms")
+        ])
+        
+        # Divide time into 10 bins and see attack distribution
+        time_bins = 10
+        df_sample_with_time = df_sample_with_time.with_columns([
+            (pl.col("relative_time_ms") / (time_range / time_bins)).cast(pl.Int32).alias("time_bin")
+        ])
+        
+        temporal_attack_dist = df_sample_with_time.group_by(["time_bin", "Attack"]).agg(
+            pl.count().alias("count")
+        ).sort(["time_bin", "count"], descending=[False, True])
+        
+        results["graph_construction_insights"]["temporal_attack_patterns"] = temporal_attack_dist.to_dicts()[:50]  # Top 50 patterns
     
     # === DATA QUALITY CHECKS ===
     print("\n=== Checking Data Quality ===")
@@ -175,26 +245,33 @@ def analyze_netflow_dataset(file_path, sample_size=100000):
     }
     
     # Feature correlations with label (for top features)
-    print("\n=== Computing Feature Importance Indicators ===")
+    print("\n=== Computing Per-Attack-Type Feature Statistics ===")
     important_features = [
         "IN_BYTES", "OUT_BYTES", "IN_PKTS", "OUT_PKTS",
-        "FLOW_DURATION_MILLISECONDS", "L4_DST_PORT", "PROTOCOL"
+        "FLOW_DURATION_MILLISECONDS", "L4_DST_PORT", "PROTOCOL",
+        "TCP_FLAGS", "SRC_TO_DST_SECOND_BYTES", "DST_TO_SRC_SECOND_BYTES",
+        "RETRANSMITTED_IN_PKTS", "RETRANSMITTED_OUT_PKTS"
     ]
     
-    feature_label_stats = {}
-    for feature in important_features:
-        if feature in df_sample.columns:
-            normal = df_sample.filter(pl.col("Label") == 0)[feature]
-            attack = df_sample.filter(pl.col("Label") == 1)[feature]
-            
-            feature_label_stats[feature] = {
-                "normal_mean": float(normal.mean()) if len(normal) > 0 else None,
-                "attack_mean": float(attack.mean()) if len(attack) > 0 else None,
-                "normal_std": float(normal.std()) if len(normal) > 0 else None,
-                "attack_std": float(attack.std()) if len(attack) > 0 else None
-            }
+    attack_feature_stats = {}
+    for attack_type in df_sample["Attack"].unique().to_list():
+        attack_data = df_sample.filter(pl.col("Attack") == attack_type)
+        attack_feature_stats[attack_type] = {
+            "sample_count": len(attack_data)
+        }
+        
+        for feature in important_features:
+            if feature in df_sample.columns:
+                try:
+                    attack_feature_stats[attack_type][feature] = {
+                        "mean": float(attack_data[feature].mean()) if attack_data[feature].mean() is not None else None,
+                        "std": float(attack_data[feature].std()) if attack_data[feature].std() is not None else None,
+                        "median": float(attack_data[feature].median()) if attack_data[feature].median() is not None else None
+                    }
+                except:
+                    attack_feature_stats[attack_type][feature] = None
     
-    results["graph_construction_insights"]["feature_label_relationship"] = feature_label_stats
+    results["graph_construction_insights"]["per_attack_feature_profiles"] = attack_feature_stats
     
     # === SAVE RESULTS ===
     output_file = "netflow_analysis_results.json"
@@ -222,5 +299,5 @@ if __name__ == "__main__":
     
     results = analyze_netflow_dataset(
         file_path=file_path,
-        sample_size=100000  # Adjust based on your memory
+        sample_size=1000000  # 1M samples - adjust based on needs (you have plenty of RAM!)
     )
