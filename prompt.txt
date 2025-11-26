@@ -1,49 +1,70 @@
-you are an expert at AI, graph and deep learning engineer, here are my task: Given a dataset which is network flow dataset has 16.94 mil row and 45 columns, your task is to predict flow’s label. There are 2 types of label in this, 1 is binary, 2 is multi  which might be one of 10 classes (Normal and 9 different types of network attack). Here is the informations about the columns:
-Feature,Description
-IPV4_SRC_ADDR,IPv4 source address
-IPV4_DST_ADDR,IPv4 destination address
-L4_SRC_PORT,IPv4 source port number
-L4_DST_PORT,IPv4 destination port number
-PROTOCOL,IP protocol identifier byte
-L7_PROTO,Layer 7 protocol (numeric)
-IN_BYTES,Incoming number of bytes
-OUT_BYTES,Outgoing number of bytes
-IN_PKTS,Incoming number of packets
-OUT_PKTS,Outgoing number of packets
-FLOW_DURATION_MILLISECONDS,Flow duration in milliseconds
-TCP_FLAGS,Cumulative of all TCP flags
-CLIENT_TCP_FLAGS,Cumulative of all client TCP flags
-SERVER_TCP_FLAGS,Cumulative of all server TCP flags
-DURATION_IN,Client to Server stream duration (msec)
-DURATION_OUT,Client to Server stream duration (msec)
-MIN_TTL,Min flow TTL
-MAX_TTL,Max flow TTL
-LONGEST_FLOW_PKT,Longest packet (bytes) of the flow
-SHORTEST_FLOW_PKT,Shortest packet (bytes) of the flow
-MIN_IP_PKT_LEN,Len of the smallest flow IP packet observed
-MAX_IP_PKT_LEN,Len of the largest flow IP packet observed
-SRC_TO_DST_SECOND_BYTES,Src to dst Bytes/sec
-DST_TO_SRC_SECOND_BYTES,Dst to src Bytes/sec
-RETRANSMITTED_IN_BYTES,Number of retransmitted TCP flow bytes (src->dst)
-RETRANSMITTED_IN_PKTS,Number of retransmitted TCP flow packets (src->dst)
-RETRANSMITTED_OUT_BYTES,Number of retransmitted TCP flow bytes (dst->src)
-RETRANSMITTED_OUT_PKTS,Number of retransmitted TCP flow packets (dst->src)
-SRC_TO_DST_AVG_THROUGHPUT,Src to dst average thpt (bps)
-DST_TO_SRC_AVG_THROUGHPUT,Dst to src average thpt (bps)
-NUM_PKTS_UP_TO_128_BYTES,Packets whose IP size <= 128
-NUM_PKTS_128_TO_256_BYTES,Packets whose IP size > 128 and <= 256
-NUM_PKTS_256_TO_512_BYTES,Packets whose IP size > 256 and <= 512
-NUM_PKTS_512_TO_1024_BYTES,Packets whose IP size > 512 and <= 1024
-NUM_PKTS_1024_TO_1514_BYTES,Packets whose IP size >1024 and <= 1514
-TCP_WIN_MAX_IN,Max TCP Window (src->dst)
-TCP_WIN_MAX_OUT,Max TCP Window (dst->src)
-ICMP_TYPE,ICMP Type * 256 + ICMP code
-ICMP_IPV4_TYPE,ICMP Type
-DNS_QUERY_ID,DNS query transaction Id
-DNS_QUERY_TYPE,"DNS query type (e.g. 1=A, 2=NS..)"
-DNS_TTL_ANSWER,TTL of the first A record (if any)
-FTP_COMMAND_RET_CODE,FTP client command return code
-Label, normal or not
-Attack, 10 types of attack
+import polars as pl
 
-My goal is to create line graph from it, which is each node is a flow and have node features, i still not sure how to build edge, but  I think we should start with how to handle this data. Now can you code something to extract information, statistic, distribution from this raw data so I could give back the result to you and you will know how to process this data, the ouput should be 1 file so  could upload easy, also, we should use polars for better. Tell me anything you need
+def downcast_column(series: pl.Series) -> pl.Series:
+    dtype = series.dtype
+
+    # 1. BOOLEAN
+    if dtype == pl.Boolean:
+        return series
+
+    # 2. INTEGER TYPES
+    if pl.datatypes.is_integer(dtype):
+        min_v = series.min()
+        max_v = series.max()
+
+        # signed integers
+        if min_v >= pl.Int8().min_value and max_v <= pl.Int8().max_value:
+            return series.cast(pl.Int8)
+        if min_v >= pl.Int16().min_value and max_v <= pl.Int16().max_value:
+            return series.cast(pl.Int16)
+        if min_v >= pl.Int32().min_value and max_v <= pl.Int32().max_value:
+            return series.cast(pl.Int32)
+        return series.cast(pl.Int64)
+
+    # 3. UNSIGNED INTEGERS
+    if pl.datatypes.is_unsigned_integer(dtype):
+        min_v = series.min()
+        max_v = series.max()
+        if max_v <= pl.UInt8().max_value:
+            return series.cast(pl.UInt8)
+        if max_v <= pl.UInt16().max_value:
+            return series.cast(pl.UInt16)
+        if max_v <= pl.UInt32().max_value:
+            return series.cast(pl.UInt32)
+        return series.cast(pl.UInt64)
+
+    # 4. FLOAT TYPES
+    if pl.datatypes.is_float(dtype):
+        # Downcast float64 → float32 if safe
+        if dtype == pl.Float64:
+            s32 = series.cast(pl.Float32)
+            # Check precision loss
+            if (series - s32.cast(pl.Float64)).abs().max() < 1e-6:
+                return s32
+        return series
+
+    # 5. STRING TYPES → consider categorical
+    if dtype == pl.String:
+        unique_ratio = series.n_unique() / len(series)
+        # Convert to categorical if many repeating values
+        if unique_ratio < 0.5:
+            return series.cast(pl.Categorical)
+        return series
+
+    # 6. DATE / DATETIME
+    if dtype in (pl.Date, pl.Datetime, pl.Time):
+        return series
+
+    # 7. CATEGORICAL
+    if dtype == pl.Categorical:
+        return series
+
+    # Fallback: return unchanged
+    return series
+
+
+def downcast_df(df: pl.DataFrame) -> pl.DataFrame:
+    return df.select([
+        downcast_column(df[col]).alias(col)
+        for col in df.columns
+    ])
