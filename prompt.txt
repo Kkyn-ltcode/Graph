@@ -1,136 +1,501 @@
 import polars as pl
 import numpy as np
+from scipy import stats
+from sklearn.preprocessing import (
+    StandardScaler, MinMaxScaler, RobustScaler, 
+    PowerTransformer, QuantileTransformer
+)
+from typing import Dict, Tuple, List, Optional
+import warnings
+warnings.filterwarnings('ignore')
 
-def optimize_dataframe(df: pl.DataFrame, verbose: bool = True) -> pl.DataFrame:
-    """
-    Optimize Polars DataFrame by downcasting columns to smaller data types.
+
+class ColumnAnalyzer:
+    """Analyzes column distributions and recommends standardization methods."""
     
-    Parameters:
-    -----------
-    df : pl.DataFrame
-        Input DataFrame to optimize
-    verbose : bool
-        If True, print memory savings information
-        
-    Returns:
-    --------
-    pl.DataFrame
-        Optimized DataFrame with downcasted columns
-    """
+    def __init__(self, df: pl.DataFrame):
+        self.df = df
+        self.numeric_cols = [col for col in df.columns if df[col].dtype in 
+                            [pl.Int8, pl.Int16, pl.Int32, pl.Int64, 
+                             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+                             pl.Float32, pl.Float64]]
+        self.scalers = {}  # Store fitted scalers for inverse transform
+        self.transformations = {}  # Store transformation info
     
-    # Store original memory usage
-    original_memory = df.estimated_size("mb")
-    
-    optimized_cols = []
-    
-    for col in df.columns:
-        dtype = df[col].dtype
-        series = df[col]
+    def analyze_column(self, col: str) -> Dict:
+        """Comprehensive analysis of a single column."""
+        data = self.df[col].drop_nulls().to_numpy()
         
-        # Handle integer types
-        if dtype in [pl.Int64, pl.Int32, pl.Int16, pl.Int8]:
-            # Get min and max values, handling nulls
-            col_min = series.min()
-            col_max = series.max()
-            
-            if col_min is not None and col_max is not None:
-                # Determine smallest integer type that can hold the data
-                if col_min >= 0:  # Unsigned integers
-                    if col_max <= 255:
-                        optimized_cols.append(series.cast(pl.UInt8))
-                    elif col_max <= 65535:
-                        optimized_cols.append(series.cast(pl.UInt16))
-                    elif col_max <= 4294967295:
-                        optimized_cols.append(series.cast(pl.UInt32))
-                    else:
-                        optimized_cols.append(series.cast(pl.UInt64))
-                else:  # Signed integers
-                    if col_min >= -128 and col_max <= 127:
-                        optimized_cols.append(series.cast(pl.Int8))
-                    elif col_min >= -32768 and col_max <= 32767:
-                        optimized_cols.append(series.cast(pl.Int16))
-                    elif col_min >= -2147483648 and col_max <= 2147483647:
-                        optimized_cols.append(series.cast(pl.Int32))
-                    else:
-                        optimized_cols.append(series)
-            else:
-                optimized_cols.append(series)
+        if len(data) == 0:
+            return {"error": "All values are null"}
         
-        # Handle unsigned integer types
-        elif dtype in [pl.UInt64, pl.UInt32, pl.UInt16, pl.UInt8]:
-            col_max = series.max()
-            
-            if col_max is not None:
-                if col_max <= 255:
-                    optimized_cols.append(series.cast(pl.UInt8))
-                elif col_max <= 65535:
-                    optimized_cols.append(series.cast(pl.UInt16))
-                elif col_max <= 4294967295:
-                    optimized_cols.append(series.cast(pl.UInt32))
-                else:
-                    optimized_cols.append(series)
-            else:
-                optimized_cols.append(series)
+        # Basic statistics
+        stats_dict = {
+            "column": col,
+            "dtype": str(self.df[col].dtype),
+            "count": len(data),
+            "missing": self.df[col].null_count(),
+            "mean": float(np.mean(data)),
+            "median": float(np.median(data)),
+            "std": float(np.std(data)),
+            "min": float(np.min(data)),
+            "max": float(np.max(data)),
+            "q25": float(np.percentile(data, 25)),
+            "q75": float(np.percentile(data, 75)),
+        }
         
-        # Handle float types
-        elif dtype == pl.Float64:
-            # Try to downcast to Float32 if precision allows
-            # Check if all values can be represented in Float32
-            optimized_cols.append(series.cast(pl.Float32))
+        # Distribution characteristics
+        stats_dict["skewness"] = float(stats.skew(data))
+        stats_dict["kurtosis"] = float(stats.kurtosis(data))
         
-        # Handle string types - convert to categorical if cardinality is low
-        elif dtype == pl.Utf8:
-            unique_ratio = series.n_unique() / len(series)
-            
-            # If less than 50% unique values, use categorical
-            if unique_ratio < 0.5:
-                optimized_cols.append(series.cast(pl.Categorical))
-            else:
-                optimized_cols.append(series)
+        # Outlier detection (IQR method)
+        iqr = stats_dict["q75"] - stats_dict["q25"]
+        lower_bound = stats_dict["q25"] - 1.5 * iqr
+        upper_bound = stats_dict["q75"] + 1.5 * iqr
+        outliers = np.sum((data < lower_bound) | (data > upper_bound))
+        stats_dict["outlier_count"] = int(outliers)
+        stats_dict["outlier_pct"] = float(outliers / len(data) * 100)
         
-        # Keep other types as-is
+        # Range and scale
+        stats_dict["range"] = stats_dict["max"] - stats_dict["min"]
+        stats_dict["coefficient_of_variation"] = (
+            stats_dict["std"] / abs(stats_dict["mean"]) 
+            if stats_dict["mean"] != 0 else np.inf
+        )
+        
+        # Normality tests
+        if len(data) >= 8:  # Minimum sample size for tests
+            _, p_shapiro = stats.shapiro(data[:5000])  # Limit for performance
+            _, p_ks = stats.kstest(data, 'norm', args=(stats_dict["mean"], stats_dict["std"]))
+            stats_dict["shapiro_p"] = float(p_shapiro)
+            stats_dict["ks_p"] = float(p_ks)
+            stats_dict["is_normal"] = (p_shapiro > 0.05) and (p_ks > 0.05)
         else:
-            optimized_cols.append(series)
-    
-    # Create optimized DataFrame
-    optimized_df = pl.DataFrame(optimized_cols)
-    
-    # Calculate and display memory savings
-    if verbose:
-        optimized_memory = optimized_df.estimated_size("mb")
-        memory_saved = original_memory - optimized_memory
-        percent_saved = (memory_saved / original_memory) * 100
+            stats_dict["is_normal"] = False
         
-        print(f"Original memory usage: {original_memory:.2f} MB")
-        print(f"Optimized memory usage: {optimized_memory:.2f} MB")
-        print(f"Memory saved: {memory_saved:.2f} MB ({percent_saved:.1f}%)")
-        print(f"\nData type changes:")
-        for col in df.columns:
-            old_dtype = df[col].dtype
-            new_dtype = optimized_df[col].dtype
-            if old_dtype != new_dtype:
-                print(f"  {col}: {old_dtype} -> {new_dtype}")
+        # Check for specific patterns
+        stats_dict["has_zeros"] = bool(np.any(data == 0))
+        stats_dict["has_negatives"] = bool(np.any(data < 0))
+        stats_dict["unique_ratio"] = len(np.unique(data)) / len(data)
+        
+        return stats_dict
     
-    return optimized_df
+    def recommend_standardization(self, stats_dict: Dict) -> Dict:
+        """Recommend standardization method based on column characteristics."""
+        
+        recommendations = {
+            "column": stats_dict["column"],
+            "primary_method": None,
+            "alternative_methods": [],
+            "reasoning": []
+        }
+        
+        # Check for errors
+        if "error" in stats_dict:
+            recommendations["primary_method"] = "None - handle missing values first"
+            return recommendations
+        
+        skew = abs(stats_dict["skewness"])
+        outlier_pct = stats_dict["outlier_pct"]
+        is_normal = stats_dict.get("is_normal", False)
+        has_negatives = stats_dict["has_negatives"]
+        cv = stats_dict["coefficient_of_variation"]
+        
+        # Decision logic for standardization method
+        
+        # 1. Highly skewed or many outliers -> Robust scaling
+        if skew > 1.0 or outlier_pct > 5:
+            recommendations["primary_method"] = "RobustScaler"
+            recommendations["reasoning"].append(
+                f"High skewness ({skew:.2f}) or outliers ({outlier_pct:.1f}%) detected"
+            )
+            recommendations["alternative_methods"].append("QuantileTransformer")
+            
+            # If highly skewed, suggest log transform
+            if skew > 2.0 and not has_negatives and not stats_dict["has_zeros"]:
+                recommendations["alternative_methods"].insert(0, "Log Transform + StandardScaler")
+                recommendations["reasoning"].append("Very high skewness - log transform recommended")
+        
+        # 2. Normal distribution -> Standard scaling
+        elif is_normal and outlier_pct < 1:
+            recommendations["primary_method"] = "StandardScaler"
+            recommendations["reasoning"].append("Data follows normal distribution")
+            recommendations["alternative_methods"].append("MinMaxScaler")
+        
+        # 3. Bounded range needed (e.g., for neural networks) -> MinMax
+        elif stats_dict["unique_ratio"] > 0.95:  # Continuous data
+            recommendations["primary_method"] = "MinMaxScaler"
+            recommendations["reasoning"].append("Continuous data - bounded range useful for ML")
+            recommendations["alternative_methods"].extend(["StandardScaler", "RobustScaler"])
+        
+        # 4. Low variance or near-constant -> Consider removing
+        elif cv < 0.1:
+            recommendations["primary_method"] = "Consider removing (low variance)"
+            recommendations["reasoning"].append(
+                f"Very low coefficient of variation ({cv:.4f}) - may not be informative"
+            )
+        
+        # 5. Default to StandardScaler
+        else:
+            recommendations["primary_method"] = "StandardScaler"
+            recommendations["reasoning"].append("General purpose standardization")
+            recommendations["alternative_methods"].extend(["RobustScaler", "MinMaxScaler"])
+        
+        # Additional considerations
+        
+        # Power transform for non-normal distributions
+        if not is_normal and skew > 0.5:
+            if "PowerTransform (Yeo-Johnson)" not in recommendations["alternative_methods"]:
+                recommendations["alternative_methods"].append("PowerTransform (Yeo-Johnson)")
+        
+        # Quantile transform for complex distributions
+        if skew > 1.5 or stats_dict["kurtosis"] > 3:
+            if "QuantileTransformer" not in recommendations["alternative_methods"]:
+                recommendations["alternative_methods"].append("QuantileTransformer")
+        
+        return recommendations
+    
+    def analyze_all_columns(self) -> pl.DataFrame:
+        """Analyze all numeric columns and return summary dataframe."""
+        results = []
+        
+        for col in self.numeric_cols:
+            stats_dict = self.analyze_column(col)
+            recommendation = self.recommend_standardization(stats_dict)
+            
+            result = {
+                **stats_dict,
+                "recommended_method": recommendation["primary_method"],
+                "alternatives": ", ".join(recommendation["alternative_methods"][:2]),
+                "reasoning": " | ".join(recommendation["reasoning"])
+            }
+            results.append(result)
+        
+        return pl.DataFrame(results)
+    
+    def print_detailed_report(self, col: str):
+        """Print detailed analysis for a specific column."""
+        stats_dict = self.analyze_column(col)
+        recommendation = self.recommend_standardization(stats_dict)
+        
+        print(f"\n{'='*70}")
+        print(f"DETAILED ANALYSIS: {col}")
+        print(f"{'='*70}")
+        
+        print(f"\n📊 Basic Statistics:")
+        print(f"  Type: {stats_dict['dtype']}")
+        print(f"  Count: {stats_dict['count']:,} | Missing: {stats_dict['missing']:,}")
+        print(f"  Mean: {stats_dict['mean']:.4f} | Median: {stats_dict['median']:.4f}")
+        print(f"  Std: {stats_dict['std']:.4f} | Range: [{stats_dict['min']:.4f}, {stats_dict['max']:.4f}]")
+        
+        print(f"\n📈 Distribution Characteristics:")
+        print(f"  Skewness: {stats_dict['skewness']:.4f} | Kurtosis: {stats_dict['kurtosis']:.4f}")
+        print(f"  CV: {stats_dict['coefficient_of_variation']:.4f}")
+        print(f"  Outliers: {stats_dict['outlier_count']} ({stats_dict['outlier_pct']:.2f}%)")
+        if 'is_normal' in stats_dict:
+            print(f"  Normal Distribution: {'Yes' if stats_dict['is_normal'] else 'No'}")
+        
+        print(f"\n🎯 Recommended Standardization:")
+        print(f"  PRIMARY: {recommendation['primary_method']}")
+        if recommendation['alternative_methods']:
+            print(f"  ALTERNATIVES: {', '.join(recommendation['alternative_methods'])}")
+        print(f"\n  Reasoning:")
+        for reason in recommendation['reasoning']:
+            print(f"    • {reason}")
+        
+        print(f"\n{'='*70}\n")
+    
+    def apply_standardization(self, col: str, method: Optional[str] = None) -> np.ndarray:
+        """Apply standardization to a column using specified or recommended method."""
+        data = self.df[col].to_numpy().reshape(-1, 1)
+        
+        # Get recommendation if method not specified
+        if method is None:
+            stats_dict = self.analyze_column(col)
+            recommendation = self.recommend_standardization(stats_dict)
+            method = recommendation["primary_method"]
+        
+        # Handle special cases
+        if "Consider removing" in method or "None" in method:
+            print(f"⚠️  {col}: {method}")
+            return data.flatten()
+        
+        # Apply transformation
+        if method == "StandardScaler":
+            scaler = StandardScaler()
+            transformed = scaler.fit_transform(data)
+            
+        elif method == "MinMaxScaler":
+            scaler = MinMaxScaler()
+            transformed = scaler.fit_transform(data)
+            
+        elif method == "RobustScaler":
+            scaler = RobustScaler()
+            transformed = scaler.fit_transform(data)
+            
+        elif "Log Transform" in method:
+            # Handle zeros and negatives
+            min_val = np.min(data)
+            if min_val <= 0:
+                shift = abs(min_val) + 1
+                data_shifted = data + shift
+            else:
+                data_shifted = data
+            
+            transformed_log = np.log(data_shifted)
+            scaler = StandardScaler()
+            transformed = scaler.fit_transform(transformed_log)
+            self.transformations[col] = {"type": "log", "shift": shift if min_val <= 0 else 0}
+            
+        elif method == "PowerTransform (Yeo-Johnson)":
+            scaler = PowerTransformer(method='yeo-johnson')
+            transformed = scaler.fit_transform(data)
+            
+        elif method == "QuantileTransformer":
+            scaler = QuantileTransformer(output_distribution='normal', n_quantiles=min(1000, len(data)))
+            transformed = scaler.fit_transform(data)
+            
+        else:
+            print(f"⚠️  Unknown method '{method}' for {col}, using StandardScaler")
+            scaler = StandardScaler()
+            transformed = scaler.fit_transform(data)
+        
+        # Store scaler for potential inverse transform
+        self.scalers[col] = scaler
+        
+        return transformed.flatten()
+    
+    def transform_dataframe(self, apply_to: str = "recommended", 
+                          custom_methods: Optional[Dict[str, str]] = None) -> pl.DataFrame:
+        """
+        Transform the entire dataframe.
+        
+        Parameters:
+        -----------
+        apply_to : str
+            "recommended" - use recommended method for each column
+            "all_standard" - apply StandardScaler to all columns
+            "all_robust" - apply RobustScaler to all columns
+            "all_minmax" - apply MinMaxScaler to all columns
+            "custom" - use custom_methods dict
+        custom_methods : dict
+            Dictionary mapping column names to standardization methods
+        
+        Returns:
+        --------
+        Transformed dataframe with same column names
+        """
+        df_transformed = self.df.clone()
+        transformation_log = []
+        
+        for col in self.numeric_cols:
+            # Determine method
+            if apply_to == "custom" and custom_methods and col in custom_methods:
+                method = custom_methods[col]
+            elif apply_to == "recommended":
+                stats_dict = self.analyze_column(col)
+                recommendation = self.recommend_standardization(stats_dict)
+                method = recommendation["primary_method"]
+            elif apply_to == "all_standard":
+                method = "StandardScaler"
+            elif apply_to == "all_robust":
+                method = "RobustScaler"
+            elif apply_to == "all_minmax":
+                method = "MinMaxScaler"
+            else:
+                method = "StandardScaler"
+            
+            # Apply transformation
+            print(f"Transforming {col} using {method}...")
+            transformed_data = self.apply_standardization(col, method)
+            
+            # Update dataframe
+            df_transformed = df_transformed.with_columns(
+                pl.Series(name=col, values=transformed_data)
+            )
+            
+            transformation_log.append({
+                "column": col,
+                "method": method,
+                "original_mean": float(self.df[col].mean()),
+                "original_std": float(self.df[col].std()),
+                "transformed_mean": float(np.mean(transformed_data)),
+                "transformed_std": float(np.std(transformed_data))
+            })
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("TRANSFORMATION SUMMARY")
+        print("="*70)
+        log_df = pl.DataFrame(transformation_log)
+        print(log_df)
+        
+        return df_transformed
+    
+    def inverse_transform(self, df_transformed: pl.DataFrame, col: str) -> np.ndarray:
+        """Inverse transform a column back to original scale."""
+        if col not in self.scalers:
+            raise ValueError(f"No scaler found for column '{col}'. Was it transformed?")
+        
+        data = df_transformed[col].to_numpy().reshape(-1, 1)
+        
+        # Handle log transform
+        if col in self.transformations and self.transformations[col]["type"] == "log":
+            data = self.scalers[col].inverse_transform(data)
+            data = np.exp(data)
+            shift = self.transformations[col]["shift"]
+            if shift > 0:
+                data = data - shift
+        else:
+            data = self.scalers[col].inverse_transform(data)
+        
+        return data.flatten()
+    
+    def compare_transformations(self, col: str, methods: List[str] = None) -> pl.DataFrame:
+        """
+        Compare different transformation methods on a single column.
+        
+        Parameters:
+        -----------
+        col : str
+            Column name to analyze
+        methods : list
+            List of methods to compare. If None, uses common methods.
+        
+        Returns:
+        --------
+        Comparison dataframe with statistics for each method
+        """
+        if methods is None:
+            methods = ["StandardScaler", "MinMaxScaler", "RobustScaler", 
+                      "PowerTransform (Yeo-Johnson)", "QuantileTransformer"]
+        
+        results = []
+        original_data = self.df[col].to_numpy()
+        
+        print(f"\n{'='*70}")
+        print(f"COMPARING TRANSFORMATIONS FOR: {col}")
+        print(f"{'='*70}\n")
+        
+        # Original statistics
+        orig_stats = {
+            "Method": "Original",
+            "Mean": float(np.mean(original_data)),
+            "Std": float(np.std(original_data)),
+            "Skewness": float(stats.skew(original_data)),
+            "Kurtosis": float(stats.kurtosis(original_data)),
+            "Min": float(np.min(original_data)),
+            "Max": float(np.max(original_data))
+        }
+        results.append(orig_stats)
+        
+        # Test each method
+        for method in methods:
+            try:
+                transformed = self.apply_standardization(col, method)
+                
+                method_stats = {
+                    "Method": method,
+                    "Mean": float(np.mean(transformed)),
+                    "Std": float(np.std(transformed)),
+                    "Skewness": float(stats.skew(transformed)),
+                    "Kurtosis": float(stats.kurtosis(transformed)),
+                    "Min": float(np.min(transformed)),
+                    "Max": float(np.max(transformed))
+                }
+                results.append(method_stats)
+            except Exception as e:
+                print(f"❌ {method} failed: {str(e)}")
+        
+        comparison_df = pl.DataFrame(results)
+        print(comparison_df)
+        
+        return comparison_df
 
 
 # Example usage
 if __name__ == "__main__":
-    # Create sample DataFrame with various data types
+    # Create sample dataframe with different distributions
+    np.random.seed(42)
+    
     df = pl.DataFrame({
-        "small_int": [1, 2, 3, 4, 5] * 100,
-        "large_int": [1000000, 2000000, 3000000] * 166 + [1000000, 2000000],
-        "float_col": [1.5, 2.7, 3.9, 4.1, 5.3] * 100,
-        "category_col": ["A", "B", "C", "A", "B"] * 100,
-        "unique_str": [f"unique_{i}" for i in range(500)]
+        "normal_dist": np.random.normal(100, 15, 1000),
+        "skewed_dist": np.random.exponential(2, 1000),
+        "with_outliers": np.concatenate([
+            np.random.normal(50, 10, 950),
+            np.random.uniform(150, 200, 50)
+        ]),
+        "uniform_dist": np.random.uniform(0, 100, 1000),
+        "log_normal": np.random.lognormal(3, 1, 1000),
+        "binary_like": np.random.choice([0, 1], 1000, p=[0.7, 0.3]),
+        "constant_ish": np.random.normal(100, 0.5, 1000),
     })
     
-    # Optimize the DataFrame
-    optimized_df = optimize_dataframe(df, verbose=True)
+    # Initialize analyzer
+    analyzer = ColumnAnalyzer(df)
     
-    print("\n" + "="*50)
-    print("Schema comparison:")
+    # Get summary for all columns
+    print("SUMMARY ANALYSIS FOR ALL COLUMNS")
+    print("="*100)
+    summary = analyzer.analyze_all_columns()
+    print(summary.select([
+        "column", "mean", "std", "skewness", "outlier_pct", 
+        "recommended_method"
+    ]))
+    
+    # Detailed report for specific columns
+    analyzer.print_detailed_report("skewed_dist")
+    
+    print("\n" + "="*100)
+    print("APPLYING TRANSFORMATIONS")
+    print("="*100 + "\n")
+    
+    # Transform entire dataframe using recommended methods
+    df_transformed = analyzer.transform_dataframe(apply_to="recommended")
+    
+    print("\n📊 Original vs Transformed Data (first 5 rows):")
     print("\nOriginal:")
-    print(df.schema)
-    print("\nOptimized:")
-    print(optimized_df.schema)
+    print(df.head())
+    print("\nTransformed:")
+    print(df_transformed.head())
+    
+    # Compare different methods for a specific column
+    print("\n" + "="*100)
+    print("METHOD COMPARISON EXAMPLE")
+    print("="*100)
+    comparison = analyzer.compare_transformations("skewed_dist")
+    
+    # Demonstrate inverse transform
+    print("\n" + "="*100)
+    print("INVERSE TRANSFORM EXAMPLE")
+    print("="*100)
+    original_vals = df["normal_dist"].head(5)
+    transformed_vals = df_transformed["normal_dist"].head(5)
+    inverse_vals = analyzer.inverse_transform(df_transformed, "normal_dist")[:5]
+    
+    comparison_df = pl.DataFrame({
+        "Original": original_vals,
+        "Transformed": transformed_vals,
+        "Inverse": inverse_vals,
+        "Difference": np.abs(original_vals.to_numpy() - inverse_vals)
+    })
+    print(comparison_df)
+    
+    # Custom transformation example
+    print("\n" + "="*100)
+    print("CUSTOM TRANSFORMATION EXAMPLE")
+    print("="*100 + "\n")
+    
+    custom_methods = {
+        "normal_dist": "MinMaxScaler",
+        "skewed_dist": "PowerTransform (Yeo-Johnson)",
+        "with_outliers": "RobustScaler"
+    }
+    
+    df_custom = analyzer.transform_dataframe(apply_to="custom", custom_methods=custom_methods)
+    
+    # Export results
+    summary.write_csv("column_analysis_report.csv")
+    df_transformed.write_csv("transformed_data.csv")
+    print("\n✅ Analysis exported to 'column_analysis_report.csv'")
+    print("✅ Transformed data exported to 'transformed_data.csv'")
