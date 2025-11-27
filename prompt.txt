@@ -1,19 +1,221 @@
-import pandas as pd
-from sklearn.model_selection import train_test_split
+import polars as pl
+import numpy as np
+from typing import Tuple, Dict
 
-# Create time blocks (e.g., hourly)
-data['time_block'] = pd.to_datetime(data['timestamp'], unit='s').dt.floor('H')
-
-splits = {'train': [], 'val': [], 'test': []}
-for block, group in data.groupby('time_block'):
-    # Stratified split within each block
-    temp_train, temp_test = train_test_split(group, test_size=0.3, stratify=group['label'])
-    temp_val, temp_test = train_test_split(temp_test, test_size=0.5, stratify=temp_test['label'])
+def stratified_temporal_split(
+    df: pl.DataFrame,
+    timestamp_col: str = 'timestamp',
+    label_col: str = 'label',
+    time_window: str = '1h',  # '1h', '30m', '1d', etc.
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    random_seed: int = 42
+) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """
+    Split time-series network flow data into train/val/test sets using 
+    stratified temporal blocks.
     
-    splits['train'].append(temp_train)
-    splits['val'].append(temp_val)
-    splits['test'].append(temp_test)
+    Args:
+        df: Polars DataFrame with network flow data
+        timestamp_col: Name of timestamp column (in seconds)
+        label_col: Name of label column
+        time_window: Size of time blocks ('1h', '30m', '1d', etc.)
+        train_ratio: Proportion for training set
+        val_ratio: Proportion for validation set
+        test_ratio: Proportion for test set
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        Tuple of (train_df, val_df, test_df)
+    """
+    
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
+        "Ratios must sum to 1.0"
+    
+    np.random.seed(random_seed)
+    
+    # Convert timestamp to datetime and create time blocks
+    df_with_blocks = df.with_columns([
+        pl.from_epoch(pl.col(timestamp_col), time_unit='s').alias('datetime'),
+    ]).with_columns([
+        pl.col('datetime').dt.truncate(time_window).alias('time_block')
+    ])
+    
+    # Get unique labels for stratification
+    unique_labels = df_with_blocks[label_col].unique().sort()
+    
+    # Initialize lists to collect split data
+    train_parts = []
+    val_parts = []
+    test_parts = []
+    
+    # Process each time block
+    time_blocks = df_with_blocks['time_block'].unique().sort()
+    
+    for block in time_blocks:
+        # Get data for current block
+        block_data = df_with_blocks.filter(pl.col('time_block') == block)
+        
+        # Skip if block is too small
+        if len(block_data) < 3:
+            # Assign small blocks to train by default
+            train_parts.append(block_data)
+            continue
+        
+        # Stratify by label within this block
+        block_train = []
+        block_val = []
+        block_test = []
+        
+        for label in unique_labels:
+            label_data = block_data.filter(pl.col(label_col) == label)
+            n_samples = len(label_data)
+            
+            if n_samples == 0:
+                continue
+            
+            # Calculate split sizes
+            n_train = max(1, int(n_samples * train_ratio))
+            n_val = max(0, int(n_samples * val_ratio))
+            n_test = n_samples - n_train - n_val
+            
+            # Handle edge case where we have very few samples
+            if n_test < 0:
+                n_val = max(0, n_samples - n_train)
+                n_test = 0
+            
+            # Shuffle and split
+            indices = np.random.permutation(n_samples)
+            
+            train_idx = indices[:n_train]
+            val_idx = indices[n_train:n_train + n_val]
+            test_idx = indices[n_train + n_val:]
+            
+            # Use row numbers to select (Polars way)
+            label_data_with_idx = label_data.with_row_index('idx')
+            
+            if len(train_idx) > 0:
+                block_train.append(
+                    label_data_with_idx.filter(pl.col('idx').is_in(train_idx))
+                )
+            if len(val_idx) > 0:
+                block_val.append(
+                    label_data_with_idx.filter(pl.col('idx').is_in(val_idx))
+                )
+            if len(test_idx) > 0:
+                block_test.append(
+                    label_data_with_idx.filter(pl.col('idx').is_in(test_idx))
+                )
+        
+        # Concatenate stratified samples from this block
+        if block_train:
+            train_parts.append(pl.concat(block_train))
+        if block_val:
+            val_parts.append(pl.concat(block_val))
+        if block_test:
+            test_parts.append(pl.concat(block_test))
+    
+    # Combine all blocks
+    train_df = pl.concat(train_parts).drop(['datetime', 'time_block', 'idx'])
+    val_df = pl.concat(val_parts).drop(['datetime', 'time_block', 'idx'])
+    test_df = pl.concat(test_parts).drop(['datetime', 'time_block', 'idx'])
+    
+    return train_df, val_df, test_df
 
-train = pd.concat(splits['train'])
-val = pd.concat(splits['val'])
-test = pd.concat(splits['test'])
+
+def print_split_statistics(
+    train_df: pl.DataFrame,
+    val_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    label_col: str = 'label'
+) -> None:
+    """Print statistics about the data splits."""
+    
+    total = len(train_df) + len(val_df) + len(test_df)
+    
+    print("=" * 60)
+    print("SPLIT STATISTICS")
+    print("=" * 60)
+    print(f"\nTotal samples: {total:,}")
+    print(f"  Train: {len(train_df):,} ({len(train_df)/total*100:.1f}%)")
+    print(f"  Val:   {len(val_df):,} ({len(val_df)/total*100:.1f}%)")
+    print(f"  Test:  {len(test_df):,} ({len(test_df)/total*100:.1f}%)")
+    
+    print("\n" + "-" * 60)
+    print("LABEL DISTRIBUTION")
+    print("-" * 60)
+    
+    # Get label distributions
+    train_dist = train_df.group_by(label_col).agg(pl.len().alias('count')).sort(label_col)
+    val_dist = val_df.group_by(label_col).agg(pl.len().alias('count')).sort(label_col)
+    test_dist = test_df.group_by(label_col).agg(pl.len().alias('count')).sort(label_col)
+    
+    # Combine for display
+    all_labels = train_dist[label_col].unique().sort()
+    
+    print(f"\n{'Label':<15} {'Train':<20} {'Val':<20} {'Test':<20}")
+    print("-" * 75)
+    
+    for label in all_labels:
+        train_count = train_dist.filter(pl.col(label_col) == label)['count'][0] if len(train_dist.filter(pl.col(label_col) == label)) > 0 else 0
+        val_count = val_dist.filter(pl.col(label_col) == label)['count'][0] if len(val_dist.filter(pl.col(label_col) == label)) > 0 else 0
+        test_count = test_dist.filter(pl.col(label_col) == label)['count'][0] if len(test_dist.filter(pl.col(label_col) == label)) > 0 else 0
+        
+        train_pct = train_count / len(train_df) * 100 if len(train_df) > 0 else 0
+        val_pct = val_count / len(val_df) * 100 if len(val_df) > 0 else 0
+        test_pct = test_count / len(test_df) * 100 if len(test_df) > 0 else 0
+        
+        print(f"{label:<15} {train_count:>6} ({train_pct:>5.1f}%)   "
+              f"{val_count:>6} ({val_pct:>5.1f}%)   "
+              f"{test_count:>6} ({test_pct:>5.1f}%)")
+    
+    print("=" * 60)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create sample network flow data
+    np.random.seed(42)
+    n_samples = 10000
+    
+    # Simulate timestamps over 24 hours
+    timestamps = np.random.randint(1700000000, 1700000000 + 86400, n_samples)
+    
+    # Simulate imbalanced labels (normal, attack1, attack2)
+    labels = np.random.choice(
+        ['normal', 'ddos', 'port_scan', 'malware'],
+        size=n_samples,
+        p=[0.7, 0.15, 0.10, 0.05]  # Imbalanced distribution
+    )
+    
+    # Create sample features
+    df = pl.DataFrame({
+        'timestamp': timestamps,
+        'src_ip': np.random.randint(0, 255, n_samples),
+        'dst_ip': np.random.randint(0, 255, n_samples),
+        'bytes': np.random.randint(100, 10000, n_samples),
+        'packets': np.random.randint(1, 100, n_samples),
+        'label': labels
+    })
+    
+    print("Original dataset shape:", df.shape)
+    print("\nPerforming stratified temporal split...")
+    
+    # Perform the split
+    train_df, val_df, test_df = stratified_temporal_split(
+        df,
+        timestamp_col='timestamp',
+        label_col='label',
+        time_window='1h',  # Use 1-hour blocks
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        random_seed=42
+    )
+    
+    # Print statistics
+    print_split_statistics(train_df, val_df, test_df, label_col='label')
+    
+    print("\nTrain set sample:")
+    print(train_df.head())
