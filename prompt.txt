@@ -10,8 +10,9 @@ def stratified_temporal_split(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
-    random_seed: int = 42
-) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    random_seed: int = 42,
+    return_indices: bool = False
+) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame] | Dict[str, np.ndarray]:
     """
     Split time-series network flow data into train/val/test sets using 
     stratified temporal blocks.
@@ -25,9 +26,11 @@ def stratified_temporal_split(
         val_ratio: Proportion for validation set
         test_ratio: Proportion for test set
         random_seed: Random seed for reproducibility
+        return_indices: If True, return indices instead of DataFrames
     
     Returns:
-        Tuple of (train_df, val_df, test_df)
+        If return_indices=False: Tuple of (train_df, val_df, test_df)
+        If return_indices=True: Dict with 'train_idx', 'val_idx', 'test_idx' as numpy arrays
     """
     
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
@@ -35,8 +38,11 @@ def stratified_temporal_split(
     
     np.random.seed(random_seed)
     
+    # Add original row index to track positions
+    df_with_index = df.with_row_index('original_idx')
+    
     # Convert timestamp to datetime and create time blocks
-    df_with_blocks = df.with_columns([
+    df_with_blocks = df_with_index.with_columns([
         pl.from_epoch(pl.col(timestamp_col), time_unit='s').alias('datetime'),
     ]).with_columns([
         pl.col('datetime').dt.truncate(time_window).alias('time_block')
@@ -93,19 +99,19 @@ def stratified_temporal_split(
             test_idx = indices[n_train + n_val:]
             
             # Use row numbers to select (Polars way)
-            label_data_with_idx = label_data.with_row_index('idx')
+            label_data_with_idx = label_data.with_row_index('block_idx')
             
             if len(train_idx) > 0:
                 block_train.append(
-                    label_data_with_idx.filter(pl.col('idx').is_in(train_idx))
+                    label_data_with_idx.filter(pl.col('block_idx').is_in(train_idx))
                 )
             if len(val_idx) > 0:
                 block_val.append(
-                    label_data_with_idx.filter(pl.col('idx').is_in(val_idx))
+                    label_data_with_idx.filter(pl.col('block_idx').is_in(val_idx))
                 )
             if len(test_idx) > 0:
                 block_test.append(
-                    label_data_with_idx.filter(pl.col('idx').is_in(test_idx))
+                    label_data_with_idx.filter(pl.col('block_idx').is_in(test_idx))
                 )
         
         # Concatenate stratified samples from this block
@@ -117,11 +123,28 @@ def stratified_temporal_split(
             test_parts.append(pl.concat(block_test))
     
     # Combine all blocks
-    train_df = pl.concat(train_parts).drop(['datetime', 'time_block', 'idx'])
-    val_df = pl.concat(val_parts).drop(['datetime', 'time_block', 'idx'])
-    test_df = pl.concat(test_parts).drop(['datetime', 'time_block', 'idx'])
+    train_df = pl.concat(train_parts).drop(['datetime', 'time_block', 'block_idx'])
+    val_df = pl.concat(val_parts).drop(['datetime', 'time_block', 'block_idx'])
+    test_df = pl.concat(test_parts).drop(['datetime', 'time_block', 'block_idx'])
     
-    return train_df, val_df, test_df
+    # Return indices or DataFrames based on flag
+    if return_indices:
+        train_idx = train_df['original_idx'].to_numpy()
+        val_idx = val_df['original_idx'].to_numpy()
+        test_idx = test_df['original_idx'].to_numpy()
+        
+        return {
+            'train_idx': train_idx,
+            'val_idx': val_idx,
+            'test_idx': test_idx
+        }
+    else:
+        # Remove original_idx before returning DataFrames
+        train_df = train_df.drop('original_idx')
+        val_df = val_df.drop('original_idx')
+        test_df = test_df.drop('original_idx')
+        
+        return train_df, val_df, test_df
 
 
 def print_split_statistics(
@@ -219,3 +242,33 @@ if __name__ == "__main__":
     
     print("\nTrain set sample:")
     print(train_df.head())
+    
+    # Example: Return indices instead
+    print("\n" + "=" * 60)
+    print("EXAMPLE: Getting indices instead of DataFrames")
+    print("=" * 60)
+    
+    indices = stratified_temporal_split(
+        df,
+        timestamp_col='timestamp',
+        label_col='label',
+        time_window='1h',
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        random_seed=42,
+        return_indices=True
+    )
+    
+    print(f"\nTrain indices: {indices['train_idx'][:10]}... (showing first 10)")
+    print(f"Val indices: {indices['val_idx'][:10]}... (showing first 10)")
+    print(f"Test indices: {indices['test_idx'][:10]}... (showing first 10)")
+    
+    print(f"\nTotal train indices: {len(indices['train_idx'])}")
+    print(f"Total val indices: {len(indices['val_idx'])}")
+    print(f"Total test indices: {len(indices['test_idx'])}")
+    
+    # You can use indices to select from original dataframe
+    print("\nUsing indices to select from original DataFrame:")
+    train_from_idx = df[indices['train_idx']]
+    print(f"Train shape using indices: {train_from_idx.shape}")
