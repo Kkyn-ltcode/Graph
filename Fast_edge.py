@@ -90,20 +90,32 @@ def fast_sample_pairs_no_duplicates(flow_array, K):
     return all_src, all_dst
 
 
-def process_dataframe(df, K, method='optimized'):
+def process_dataframe(df, K, method='optimized', return_polars=True):
     """
     Main function to process dataframe with timing
     
     Parameters:
     -----------
-    df : DataFrame with 'id' column
+    df : DataFrame with 'id' column (pandas or polars)
     K : int, number of samples per row (e.g., 30)
     method : 'optimized' or 'no_duplicates'
+    return_polars : bool, if True returns polars DataFrame, else numpy arrays
+    
+    Returns:
+    --------
+    If return_polars=True: polars DataFrame with columns ['src', 'dst']
+    If return_polars=False: tuple of (All_src, All_dst) numpy arrays
     """
+    import polars as pl
+    
     print(f"Processing {len(df):,} rows with K={K}")
     print(f"Total output size: {len(df) * K:,} pairs")
     
-    Flow_array = df['id'].to_numpy()
+    # Handle both pandas and polars input
+    if hasattr(df, 'to_numpy'):  # pandas
+        Flow_array = df['id'].to_numpy()
+    else:  # polars
+        Flow_array = df['id'].to_numpy()
     
     # Choose method
     if method == 'optimized' or K <= 50:
@@ -114,45 +126,69 @@ def process_dataframe(df, K, method='optimized'):
         All_src, All_dst = fast_sample_pairs_no_duplicates(Flow_array, K)
     
     print(f"Generated {len(All_src):,} pairs")
-    return All_src, All_dst
+    
+    if return_polars:
+        # Create polars DataFrame
+        result_df = pl.DataFrame({
+            'src': All_src,
+            'dst': All_dst
+        })
+        print(f"Returned polars DataFrame with shape: {result_df.shape}")
+        return result_df
+    else:
+        return All_src, All_dst
 
 
 # Example usage and benchmark
 if __name__ == "__main__":
     import time
+    import polars as pl
     
     # Test with realistic data size
     print("="*60)
     print("BENCHMARK: Fast Sampling for Large DataFrames")
     print("="*60)
     
-    # Test 1: Small test (100K rows)
-    print("\n[Test 1] 100,000 rows, K=30")
+    # Test 1: Small test (100K rows) - Polars output
+    print("\n[Test 1] 100,000 rows, K=30 -> Polars DataFrame")
     np.random.seed(42)
     df_small = pd.DataFrame({'id': np.random.randint(0, 1000000, size=100000)})
     
     start = time.time()
-    All_src, All_dst = process_dataframe(df_small, K=30)
+    result_df = process_dataframe(df_small, K=30, return_polars=True)
     elapsed = time.time() - start
     
     print(f"✓ Completed in {elapsed:.2f} seconds")
     print(f"  Speed: {len(df_small)/elapsed:,.0f} rows/second")
+    print(f"  Result shape: {result_df.shape}")
+    print(f"  First 5 rows:\n{result_df.head(5)}")
+    
+    # Test 2: Get numpy arrays instead
+    print("\n[Test 2] 100,000 rows, K=30 -> Numpy Arrays")
+    start = time.time()
+    All_src, All_dst = process_dataframe(df_small, K=30, return_polars=False)
+    elapsed = time.time() - start
+    
+    print(f"✓ Completed in {elapsed:.2f} seconds")
+    print(f"  Arrays shape: src={All_src.shape}, dst={All_dst.shape}")
     print(f"  First 5 pairs: src={All_src[:5]}, dst={All_dst[:5]}")
     
-    # Test 2: Medium test (1M rows) - extrapolate to 7M
-    print("\n[Test 2] 1,000,000 rows, K=30")
+    # Test 3: Medium test (1M rows) - extrapolate to 7M
+    print("\n[Test 3] 1,000,000 rows, K=30 -> Polars DataFrame")
     df_medium = pd.DataFrame({'id': np.random.randint(0, 1000000, size=1000000)})
     
     start = time.time()
-    All_src, All_dst = process_dataframe(df_medium, K=30)
+    result_df = process_dataframe(df_medium, K=30, return_polars=True)
     elapsed = time.time() - start
     
     print(f"✓ Completed in {elapsed:.2f} seconds")
     print(f"  Speed: {len(df_medium)/elapsed:,.0f} rows/second")
+    print(f"  Memory usage: ~{result_df.estimated_size('mb'):.1f} MB")
     
     # Extrapolate to 7M rows
     estimated_time_7m = elapsed * 7
     print(f"\n[Projection] 7,000,000 rows would take: {estimated_time_7m/60:.1f} minutes")
+    print(f"  Output DataFrame size: {7_000_000 * 30:,} rows")
     print(f"  vs Original: 400 hours = {400*60:.0f} minutes")
     print(f"  Speedup: {(400*60)/(estimated_time_7m/60):.0f}x faster!")
     print("="*60)
