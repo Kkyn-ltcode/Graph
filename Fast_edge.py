@@ -3,38 +3,137 @@ from numba import njit, prange
 import pandas as pd
 
 @njit(parallel=True)
-def fast_sample_pairs_optimized(flow_array, K):
+def fast_sample_pairs_adaptive(flow_array, K):
     """
-    Ultra-fast parallel sampling optimized for small K (like 30)
-    Uses index-based rejection sampling for maximum speed
+    Adaptive sampling that automatically chooses the best method:
+    - When K is small relative to N: use rejection sampling
+    - When K is close to N: use exclusion enumeration
+    
+    Threshold: if K > N/2, use enumeration; otherwise use rejection
+    """
+    N = len(flow_array)
+    effective_K = min(K, N - 1)  # Can't sample more than N-1
+    
+    all_src = np.empty(N * effective_K, dtype=flow_array.dtype)
+    all_dst = np.empty(N * effective_K, dtype=flow_array.dtype)
+    
+    # Adaptive threshold: use enumeration when K is large relative to N
+    use_enumeration = (effective_K > N // 2)
+    
+    for i in prange(N):
+        start_idx = i * effective_K
+        
+        # Fill source values
+        for k in range(effective_K):
+            all_src[start_idx + k] = flow_array[i]
+        
+        if use_enumeration:
+            # Method 1: Enumerate all indices except i, then shuffle
+            # This is faster when K is close to N
+            candidates = np.empty(N - 1, dtype=np.int64)
+            idx = 0
+            for j in range(N):
+                if j != i:
+                    candidates[idx] = j
+                    idx += 1
+            
+            # Partial Fisher-Yates shuffle (only shuffle first K positions)
+            for k in range(effective_K):
+                rand_pos = np.random.randint(k, N - 1)
+                candidates[k], candidates[rand_pos] = candidates[rand_pos], candidates[k]
+            
+            # Copy sampled values
+            for k in range(effective_K):
+                all_dst[start_idx + k] = flow_array[candidates[k]]
+        else:
+            # Method 2: Rejection sampling with index mapping
+            # This is faster when K is small relative to N
+            sampled_count = 0
+            
+            while sampled_count < effective_K:
+                rand_idx = np.random.randint(0, N - 1)
+                if rand_idx >= i:
+                    rand_idx += 1
+                
+                # Check for duplicates
+                is_duplicate = False
+                for j in range(sampled_count):
+                    if all_dst[start_idx + j] == flow_array[rand_idx]:
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    all_dst[start_idx + sampled_count] = flow_array[rand_idx]
+                    sampled_count += 1
+    
+    return all_src, all_dst
+
+
+@njit(parallel=True)
+def fast_sample_pairs_small_n(flow_array, K):
+    """
+    Specialized version optimized for small N (N < 1000)
+    Uses full enumeration approach which is fastest for small datasets
+    """
+    N = len(flow_array)
+    effective_K = min(K, N - 1)
+    
+    all_src = np.empty(N * effective_K, dtype=flow_array.dtype)
+    all_dst = np.empty(N * effective_K, dtype=flow_array.dtype)
+    
+    for i in prange(N):
+        start_idx = i * effective_K
+        
+        # Fill source values
+        for k in range(effective_K):
+            all_src[start_idx + k] = flow_array[i]
+        
+        # Build candidate array (all indices except i)
+        candidates = np.empty(N - 1, dtype=np.int64)
+        idx = 0
+        for j in range(N):
+            if j != i:
+                candidates[idx] = j
+                idx += 1
+        
+        # Shuffle only the first K elements (partial Fisher-Yates)
+        for k in range(effective_K):
+            rand_pos = np.random.randint(k, N - 1)
+            candidates[k], candidates[rand_pos] = candidates[rand_pos], candidates[k]
+        
+        # Copy sampled values
+        for k in range(effective_K):
+            all_dst[start_idx + k] = flow_array[candidates[k]]
+    
+    return all_src, all_dst
+
+
+@njit(parallel=True)
+def fast_sample_pairs_large_n(flow_array, K):
+    """
+    Specialized version optimized for large N (N > 100K) and small K
+    Uses rejection sampling which is fastest when K << N
     """
     N = len(flow_array)
     
-    # Pre-allocate output arrays (exact size)
     all_src = np.empty(N * K, dtype=flow_array.dtype)
     all_dst = np.empty(N * K, dtype=flow_array.dtype)
     
-    # Parallel loop over all rows
     for i in prange(N):
         start_idx = i * K
         
-        # Fill source values (vectorized)
+        # Fill source values
         for k in range(K):
             all_src[start_idx + k] = flow_array[i]
         
-        # Sample K distinct indices != i
+        # Rejection sampling (fast for small K)
         sampled_count = 0
-        
-        # Use rejection sampling (very fast for small K)
         while sampled_count < K:
-            # Generate random index
             rand_idx = np.random.randint(0, N - 1)
-            
-            # Map to exclude index i: if rand_idx >= i, shift by 1
             if rand_idx >= i:
                 rand_idx += 1
             
-            # Check for duplicates in already sampled indices
+            # Check for duplicates
             is_duplicate = False
             for j in range(sampled_count):
                 if all_dst[start_idx + j] == flow_array[rand_idx]:
@@ -48,147 +147,95 @@ def fast_sample_pairs_optimized(flow_array, K):
     return all_src, all_dst
 
 
-@njit(parallel=True)
-def fast_sample_pairs_no_duplicates(flow_array, K):
+def process_dataframe(df, K, method='auto'):
     """
-    Alternative version using set-like behavior for duplicate checking
-    Faster for larger K values (K > 50)
-    """
-    N = len(flow_array)
-    
-    all_src = np.empty(N * K, dtype=flow_array.dtype)
-    all_dst = np.empty(N * K, dtype=flow_array.dtype)
-    
-    for i in prange(N):
-        start_idx = i * K
-        
-        # Fill sources
-        for k in range(K):
-            all_src[start_idx + k] = flow_array[i]
-        
-        # Build exclusion set using a temporary array
-        sampled_indices = np.empty(K, dtype=np.int64)
-        sampled_count = 0
-        
-        while sampled_count < K:
-            rand_idx = np.random.randint(0, N - 1)
-            if rand_idx >= i:
-                rand_idx += 1
-            
-            # Check if index already sampled
-            already_used = False
-            for j in range(sampled_count):
-                if sampled_indices[j] == rand_idx:
-                    already_used = True
-                    break
-            
-            if not already_used:
-                sampled_indices[sampled_count] = rand_idx
-                all_dst[start_idx + sampled_count] = flow_array[rand_idx]
-                sampled_count += 1
-    
-    return all_src, all_dst
-
-
-def process_dataframe(df, K, method='optimized', return_polars=True):
-    """
-    Main function to process dataframe with timing
+    Main function with automatic method selection
     
     Parameters:
     -----------
-    df : DataFrame with 'id' column (pandas or polars)
-    K : int, number of samples per row (e.g., 30)
-    method : 'optimized' or 'no_duplicates'
-    return_polars : bool, if True returns polars DataFrame, else numpy arrays
-    
-    Returns:
-    --------
-    If return_polars=True: polars DataFrame with columns ['src', 'dst']
-    If return_polars=False: tuple of (All_src, All_dst) numpy arrays
+    df : DataFrame with 'id' column
+    K : int, number of samples per row
+    method : 'auto', 'adaptive', 'small_n', or 'large_n'
     """
-    import polars as pl
+    N = len(df)
+    print(f"Processing {N:,} rows with K={K}")
     
-    print(f"Processing {len(df):,} rows with K={K}")
-    print(f"Total output size: {len(df) * K:,} pairs")
+    Flow_array = df['id'].to_numpy()
     
-    # Handle both pandas and polars input
-    if hasattr(df, 'to_numpy'):  # pandas
-        Flow_array = df['id'].to_numpy()
-    else:  # polars
-        Flow_array = df['id'].to_numpy()
+    # Auto-select best method
+    if method == 'auto':
+        if N < 1000:
+            method = 'small_n'
+        elif K > N // 2:
+            method = 'adaptive'
+        else:
+            method = 'large_n'
+        print(f"Auto-selected method: {method}")
     
-    # Choose method
-    if method == 'optimized' or K <= 50:
-        print("Using optimized rejection sampling...")
-        All_src, All_dst = fast_sample_pairs_optimized(Flow_array, K)
-    else:
-        print("Using index-based sampling...")
-        All_src, All_dst = fast_sample_pairs_no_duplicates(Flow_array, K)
+    # Execute chosen method
+    if method == 'small_n':
+        print("Using enumeration method (optimal for small N)...")
+        All_src, All_dst = fast_sample_pairs_small_n(Flow_array, K)
+    elif method == 'adaptive':
+        print("Using adaptive method (handles variable N/K ratios)...")
+        All_src, All_dst = fast_sample_pairs_adaptive(Flow_array, K)
+    else:  # large_n
+        print("Using rejection sampling (optimal for large N, small K)...")
+        All_src, All_dst = fast_sample_pairs_large_n(Flow_array, K)
     
     print(f"Generated {len(All_src):,} pairs")
-    
-    if return_polars:
-        # Create polars DataFrame
-        result_df = pl.DataFrame({
-            'src': All_src,
-            'dst': All_dst
-        })
-        print(f"Returned polars DataFrame with shape: {result_df.shape}")
-        return result_df
-    else:
-        return All_src, All_dst
+    return All_src, All_dst
 
 
-# Example usage and benchmark
+# Comprehensive benchmark
 if __name__ == "__main__":
     import time
-    import polars as pl
     
-    # Test with realistic data size
-    print("="*60)
-    print("BENCHMARK: Fast Sampling for Large DataFrames")
-    print("="*60)
+    print("="*70)
+    print("COMPREHENSIVE BENCHMARK: Adaptive Sampling")
+    print("="*70)
     
-    # Test 1: Small test (100K rows) - Polars output
-    print("\n[Test 1] 100,000 rows, K=30 -> Polars DataFrame")
-    np.random.seed(42)
-    df_small = pd.DataFrame({'id': np.random.randint(0, 1000000, size=100000)})
+    test_cases = [
+        (30, 30, "Edge case: N=K (small)"),
+        (100, 50, "Small N, K=N/2"),
+        (1000, 30, "Medium N, small K"),
+        (100000, 30, "Large N, small K"),
+        (1000000, 30, "Very large N, small K"),
+    ]
+    
+    for N, K, description in test_cases:
+        print(f"\n{'='*70}")
+        print(f"Test: {description}")
+        print(f"N={N:,}, K={K}")
+        print(f"{'='*70}")
+        
+        np.random.seed(42)
+        df = pd.DataFrame({'id': np.random.randint(0, 1000000, size=N)})
+        
+        start = time.time()
+        All_src, All_dst = process_dataframe(df, K=K, method='auto')
+        elapsed = time.time() - start
+        
+        print(f"✓ Completed in {elapsed:.4f} seconds")
+        if elapsed > 0.001:
+            print(f"  Speed: {N/elapsed:,.0f} rows/second")
+        print(f"  Output size: {len(All_src):,} pairs")
+        print(f"  Sample: src={All_src[:3]}, dst={All_dst[:3]}")
+    
+    # Final projection for 7M rows
+    print(f"\n{'='*70}")
+    print("PROJECTION FOR YOUR 7M ROW DATASET")
+    print(f"{'='*70}")
+    
+    print("\nTesting 1M rows to extrapolate...")
+    df_test = pd.DataFrame({'id': np.random.randint(0, 1000000, size=1000000)})
     
     start = time.time()
-    result_df = process_dataframe(df_small, K=30, return_polars=True)
+    All_src, All_dst = process_dataframe(df_test, K=30)
     elapsed = time.time() - start
     
-    print(f"✓ Completed in {elapsed:.2f} seconds")
-    print(f"  Speed: {len(df_small)/elapsed:,.0f} rows/second")
-    print(f"  Result shape: {result_df.shape}")
-    print(f"  First 5 rows:\n{result_df.head(5)}")
-    
-    # Test 2: Get numpy arrays instead
-    print("\n[Test 2] 100,000 rows, K=30 -> Numpy Arrays")
-    start = time.time()
-    All_src, All_dst = process_dataframe(df_small, K=30, return_polars=False)
-    elapsed = time.time() - start
-    
-    print(f"✓ Completed in {elapsed:.2f} seconds")
-    print(f"  Arrays shape: src={All_src.shape}, dst={All_dst.shape}")
-    print(f"  First 5 pairs: src={All_src[:5]}, dst={All_dst[:5]}")
-    
-    # Test 3: Medium test (1M rows) - extrapolate to 7M
-    print("\n[Test 3] 1,000,000 rows, K=30 -> Polars DataFrame")
-    df_medium = pd.DataFrame({'id': np.random.randint(0, 1000000, size=1000000)})
-    
-    start = time.time()
-    result_df = process_dataframe(df_medium, K=30, return_polars=True)
-    elapsed = time.time() - start
-    
-    print(f"✓ Completed in {elapsed:.2f} seconds")
-    print(f"  Speed: {len(df_medium)/elapsed:,.0f} rows/second")
-    print(f"  Memory usage: ~{result_df.estimated_size('mb'):.1f} MB")
-    
-    # Extrapolate to 7M rows
-    estimated_time_7m = elapsed * 7
-    print(f"\n[Projection] 7,000,000 rows would take: {estimated_time_7m/60:.1f} minutes")
-    print(f"  Output DataFrame size: {7_000_000 * 30:,} rows")
-    print(f"  vs Original: 400 hours = {400*60:.0f} minutes")
-    print(f"  Speedup: {(400*60)/(estimated_time_7m/60):.0f}x faster!")
-    print("="*60)
+    estimated_7m = elapsed * 7
+    print(f"\nEstimated time for 7M rows: {estimated_7m/60:.2f} minutes")
+    print(f"Original time: 400 hours = {400*60:.0f} minutes")
+    print(f"Speedup: {(400*60)/(estimated_7m/60):,.0f}x faster! 🚀")
+    print("="*70)
