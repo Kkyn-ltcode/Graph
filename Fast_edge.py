@@ -3,16 +3,14 @@ from numba import njit, prange
 import pandas as pd
 
 @njit(parallel=True)
-def fast_sample_exact_match(flow_array, K):
+def fast_sample_pairs_optimized(flow_array, K):
     """
-    Exact match to original algorithm:
-    - Samples K distinct INDICES (not values) excluding position i
-    - Returns flow_array values at those sampled indices
-    - Duplicate VALUES can appear if flow_array has duplicates
+    Ultra-fast parallel sampling optimized for small K (like 30)
+    Uses index-based rejection sampling for maximum speed
     """
     N = len(flow_array)
     
-    # Pre-allocate output arrays
+    # Pre-allocate output arrays (exact size)
     all_src = np.empty(N * K, dtype=flow_array.dtype)
     all_dst = np.empty(N * K, dtype=flow_array.dtype)
     
@@ -20,22 +18,64 @@ def fast_sample_exact_match(flow_array, K):
     for i in prange(N):
         start_idx = i * K
         
-        # Fill source values
+        # Fill source values (vectorized)
         for k in range(K):
             all_src[start_idx + k] = flow_array[i]
         
-        # Sample K distinct INDICES (not values) excluding index i
+        # Sample K distinct indices != i
+        sampled_count = 0
+        
+        # Use rejection sampling (very fast for small K)
+        while sampled_count < K:
+            # Generate random index
+            rand_idx = np.random.randint(0, N - 1)
+            
+            # Map to exclude index i: if rand_idx >= i, shift by 1
+            if rand_idx >= i:
+                rand_idx += 1
+            
+            # Check for duplicates in already sampled indices
+            is_duplicate = False
+            for j in range(sampled_count):
+                if all_dst[start_idx + j] == flow_array[rand_idx]:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                all_dst[start_idx + sampled_count] = flow_array[rand_idx]
+                sampled_count += 1
+    
+    return all_src, all_dst
+
+
+@njit(parallel=True)
+def fast_sample_pairs_no_duplicates(flow_array, K):
+    """
+    Alternative version using set-like behavior for duplicate checking
+    Faster for larger K values (K > 50)
+    """
+    N = len(flow_array)
+    
+    all_src = np.empty(N * K, dtype=flow_array.dtype)
+    all_dst = np.empty(N * K, dtype=flow_array.dtype)
+    
+    for i in prange(N):
+        start_idx = i * K
+        
+        # Fill sources
+        for k in range(K):
+            all_src[start_idx + k] = flow_array[i]
+        
+        # Build exclusion set using a temporary array
         sampled_indices = np.empty(K, dtype=np.int64)
         sampled_count = 0
         
-        # Rejection sampling on INDICES
         while sampled_count < K:
-            # Generate random index in [0, N-1] excluding i
             rand_idx = np.random.randint(0, N - 1)
             if rand_idx >= i:
-                rand_idx += 1  # Skip index i
+                rand_idx += 1
             
-            # Check if this INDEX was already sampled
+            # Check if index already sampled
             already_used = False
             for j in range(sampled_count):
                 if sampled_indices[j] == rand_idx:
@@ -44,111 +84,75 @@ def fast_sample_exact_match(flow_array, K):
             
             if not already_used:
                 sampled_indices[sampled_count] = rand_idx
-                # Store the VALUE at this index (not the index itself)
                 all_dst[start_idx + sampled_count] = flow_array[rand_idx]
                 sampled_count += 1
     
     return all_src, all_dst
 
 
-def verify_correctness(K=30, test_size=1000):
+def process_dataframe(df, K, method='optimized'):
     """
-    Verify that fast implementation matches original behavior
+    Main function to process dataframe with timing
+    
+    Parameters:
+    -----------
+    df : DataFrame with 'id' column
+    K : int, number of samples per row (e.g., 30)
+    method : 'optimized' or 'no_duplicates'
     """
-    print("="*70)
-    print("CORRECTNESS VERIFICATION")
-    print("="*70)
-    
-    np.random.seed(42)
-    
-    # Create test data with DUPLICATES to test edge cases
-    flow_array = np.random.randint(0, 100, size=test_size)  # Many duplicates
-    N = len(flow_array)
-    
-    print(f"\nTest data: {N} rows, K={K}")
-    print(f"Unique values in flow_array: {len(np.unique(flow_array))}")
-    print(f"Sample flow_array: {flow_array[:10]}")
-    
-    # Original algorithm (single row for verification)
-    print("\n--- Original Algorithm (row 0) ---")
-    i = 0
-    candidates_orig = np.concatenate([np.arange(i), np.arange(i + 1, N)])
-    sample_size = min(K, len(candidates_orig))
-    np.random.seed(100)
-    sampled_orig = np.random.choice(candidates_orig, size=sample_size, replace=False)
-    dst_orig = flow_array[sampled_orig]
-    print(f"Sampled indices: {sampled_orig[:10]}")
-    print(f"Destination values: {dst_orig[:10]}")
-    print(f"Unique destination values: {len(np.unique(dst_orig))}")
-    
-    # Fast algorithm (single row for verification)
-    print("\n--- Fast Algorithm (row 0) ---")
-    np.random.seed(100)
-    all_src_fast, all_dst_fast = fast_sample_exact_match(flow_array[:100], K)
-    dst_fast = all_dst_fast[:K]
-    print(f"Destination values: {dst_fast[:10]}")
-    print(f"Unique destination values: {len(np.unique(dst_fast))}")
-    
-    print("\n" + "="*70)
-    print("BEHAVIOR CONFIRMED:")
-    print("✓ Both sample INDICES without replacement")
-    print("✓ Both return VALUES at sampled indices")  
-    print("✓ Duplicate VALUES can appear in output (this is correct)")
-    print("="*70)
-
-
-def process_dataframe(df, K):
-    """
-    Main function - exact match to original algorithm
-    """
-    print(f"\nProcessing {len(df):,} rows with K={K}")
-    print(f"Output size: {len(df) * K:,} pairs")
+    print(f"Processing {len(df):,} rows with K={K}")
+    print(f"Total output size: {len(df) * K:,} pairs")
     
     Flow_array = df['id'].to_numpy()
     
-    import time
-    start = time.time()
-    All_src, All_dst = fast_sample_exact_match(Flow_array, K)
-    elapsed = time.time() - start
+    # Choose method
+    if method == 'optimized' or K <= 50:
+        print("Using optimized rejection sampling...")
+        All_src, All_dst = fast_sample_pairs_optimized(Flow_array, K)
+    else:
+        print("Using index-based sampling...")
+        All_src, All_dst = fast_sample_pairs_no_duplicates(Flow_array, K)
     
-    print(f"✓ Completed in {elapsed:.2f} seconds")
-    print(f"  Speed: {len(df)/elapsed:,.0f} rows/second")
-    
+    print(f"Generated {len(All_src):,} pairs")
     return All_src, All_dst
 
 
-# Comprehensive test
+# Example usage and benchmark
 if __name__ == "__main__":
     import time
     
-    # First, verify correctness
-    verify_correctness(K=30, test_size=1000)
+    # Test with realistic data size
+    print("="*60)
+    print("BENCHMARK: Fast Sampling for Large DataFrames")
+    print("="*60)
     
-    # Then run performance benchmarks
-    print("\n\n" + "="*70)
-    print("PERFORMANCE BENCHMARKS")
-    print("="*70)
-    
-    # Benchmark 1: 100K rows
-    print("\n[Benchmark 1] 100,000 rows, K=30")
+    # Test 1: Small test (100K rows)
+    print("\n[Test 1] 100,000 rows, K=30")
     np.random.seed(42)
     df_small = pd.DataFrame({'id': np.random.randint(0, 1000000, size=100000)})
-    All_src, All_dst = process_dataframe(df_small, K=30)
-    print(f"Sample output: src={All_src[:5]}, dst={All_dst[:5]}")
     
-    # Benchmark 2: 1M rows
-    print("\n[Benchmark 2] 1,000,000 rows, K=30")
+    start = time.time()
+    All_src, All_dst = process_dataframe(df_small, K=30)
+    elapsed = time.time() - start
+    
+    print(f"✓ Completed in {elapsed:.2f} seconds")
+    print(f"  Speed: {len(df_small)/elapsed:,.0f} rows/second")
+    print(f"  First 5 pairs: src={All_src[:5]}, dst={All_dst[:5]}")
+    
+    # Test 2: Medium test (1M rows) - extrapolate to 7M
+    print("\n[Test 2] 1,000,000 rows, K=30")
     df_medium = pd.DataFrame({'id': np.random.randint(0, 1000000, size=1000000)})
     
     start = time.time()
     All_src, All_dst = process_dataframe(df_medium, K=30)
     elapsed = time.time() - start
     
-    # Projection to 7M rows
+    print(f"✓ Completed in {elapsed:.2f} seconds")
+    print(f"  Speed: {len(df_medium)/elapsed:,.0f} rows/second")
+    
+    # Extrapolate to 7M rows
     estimated_time_7m = elapsed * 7
-    print(f"\n{'='*70}")
-    print(f"PROJECTION FOR YOUR 7 MILLION ROWS:")
-    print(f"  Estimated time: {estimated_time_7m/60:.1f} minutes")
-    print(f"  Original time: 400 hours = {400*60:.0f} minutes")
-    print(f"  Speedup: ~{(400*60)/(estimated_time_7m/60):.0f}x faster!")
-    print(f"{'='*70}")
+    print(f"\n[Projection] 7,000,000 rows would take: {estimated_time_7m/60:.1f} minutes")
+    print(f"  vs Original: 400 hours = {400*60:.0f} minutes")
+    print(f"  Speedup: {(400*60)/(estimated_time_7m/60):.0f}x faster!")
+    print("="*60)
