@@ -1,44 +1,69 @@
-I need help creating a complete structure for my research paper. Here's the context:
+IDS2018 v2
+Model
+Accuracy
+Precision
+Recall
+F1
+Traffic (Edge)
+98.81
+85.30
+96.44
+89.06
+Line (Node)
+99.48
+93.57
+77.84
+80.25
+Fusion
+99.56
+89.65
+92.44
+89.17
+Traffic (TPA)
+99.81
+85.29
+96.23
+89.01
+Chợ 
+88.15
+77.70
+88.15
+82.60
+FeCoGraph [45]
+99.52
+84.41
+79.07
+81.38
 
-**Research Topic:** [YOUR SPECIFIC TOPIC]
 
-**My Code/Implementation:** 
-[BRIEF DESCRIPTION - what problem it solves, what methods/algorithms you used, what makes it novel]
 
-**Reference Papers I'm Following:**
-Paper 1: [Title and brief description of approach]
-Paper 2: [Title and brief description of approach]
-[Add more if relevant]
 
-**Target Venue:** [Conference/Journal name, e.g., IEEE, ACM, NeurIPS, etc.]
+95.19%
+54.82% 
+58.97% 
+55.66%
+ToN v2
+Traffic (TPA)
+98.24
+94.63
+97.15
+95.77
+BoT v3
+Traffic (TPA)
+99.75
+94.64
+98.33
+96.28
+UNSW v2
+Traffic (TPA)
+98.63
+63.67
+74.30
+65.92
+UQ-NIDS
+Traffic (TPA)
+98.63
+78.66
+93.11
+82.31
 
-**Key Contributions:**
-1. [First main contribution]
-2. [Second main contribution]
-3. [Third contribution if any]
-
-**Experimental Results Available:**
-- [Type of experiments you ran]
-- [Datasets used]
-- [Metrics evaluated]
-- [Comparison baselines]
-
----
-
-Please create a detailed paper structure including:
-
-1. **Title suggestions** (3-5 options that are concise and descriptive)
-
-2. **Complete section outline** with:
-   - Main sections (Abstract, Introduction, Related Work, etc.)
-   - Subsections for each main section
-   - 2-3 bullet points describing what should go in each subsection
-   - Estimated word count or page allocation for each section
-
-3. **Flow narrative** - a brief description of how sections connect to tell a coherent story
-
-4. **Figure/Table placeholders** - suggest where diagrams, algorithm pseudocode, results tables, or charts would strengthen the paper
-
-5. **Key technical terms and vocabulary** I should consistently use throughout
-
-Make the structure appropriate for a [LENGTH: e.g., 6-8 page conference paper / 10-12 page journal article] following standard academic conventions in [YOUR FIELD].
