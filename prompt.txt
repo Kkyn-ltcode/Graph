@@ -1,33 +1,44 @@
-import pandas as pd
-from openpyxl import load_workbook
+I need help creating a complete structure for my research paper. Here's the context:
 
-wb = load_workbook("file.xlsx", data_only=True)
-ws = wb.active
+**Research Topic:** [YOUR SPECIFIC TOPIC]
 
-data = []
-for row in ws.iter_rows():
-    row_values = []
-    row_colors = []
-    for cell in row:
-        # value
-        row_values.append(cell.value)
+**My Code/Implementation:** 
+[BRIEF DESCRIPTION - what problem it solves, what methods/algorithms you used, what makes it novel]
 
-        # color (fgColor = fill color)
-        color = cell.fill.fgColor.rgb
-        if color == "00000000":  # default = no color
-            color = None
-        row_colors.append(color)
+**Reference Papers I'm Following:**
+Paper 1: [Title and brief description of approach]
+Paper 2: [Title and brief description of approach]
+[Add more if relevant]
 
-    data.append((row_values, row_colors))
+**Target Venue:** [Conference/Journal name, e.g., IEEE, ACM, NeurIPS, etc.]
 
-# Convert to dataframe (merge value + color)
-value_df = pd.DataFrame([v for v, c in data])
-color_df = pd.DataFrame([c for v, c in data])
+**Key Contributions:**
+1. [First main contribution]
+2. [Second main contribution]
+3. [Third contribution if any]
 
-# Rename columns
-value_df.columns = [f"col{i}_value" for i in range(value_df.shape[1])]
-color_df.columns = [f"col{i}_color" for i in range(color_df.shape[1])]
+**Experimental Results Available:**
+- [Type of experiments you ran]
+- [Datasets used]
+- [Metrics evaluated]
+- [Comparison baselines]
 
-df = pd.concat([value_df, color_df], axis=1)
+---
 
-print(df)
+Please create a detailed paper structure including:
+
+1. **Title suggestions** (3-5 options that are concise and descriptive)
+
+2. **Complete section outline** with:
+   - Main sections (Abstract, Introduction, Related Work, etc.)
+   - Subsections for each main section
+   - 2-3 bullet points describing what should go in each subsection
+   - Estimated word count or page allocation for each section
+
+3. **Flow narrative** - a brief description of how sections connect to tell a coherent story
+
+4. **Figure/Table placeholders** - suggest where diagrams, algorithm pseudocode, results tables, or charts would strengthen the paper
+
+5. **Key technical terms and vocabulary** I should consistently use throughout
+
+Make the structure appropriate for a [LENGTH: e.g., 6-8 page conference paper / 10-12 page journal article] following standard academic conventions in [YOUR FIELD].
